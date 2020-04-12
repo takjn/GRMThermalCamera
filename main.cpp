@@ -235,7 +235,7 @@ static void Start_LCD_Display(void) {
     DisplayBase::rect_t rect;
 
     // for camera image
-    rect.vs = HEATMAP_PIXEL_VW;
+    rect.vs = 0;
     rect.vw = HEATMAP_PIXEL_VW;
     rect.hs = HEATMAP_PIXEL_HW;
     rect.hw = HEATMAP_PIXEL_HW;
