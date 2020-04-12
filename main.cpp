@@ -310,6 +310,8 @@ static void drp_task(void) {
             R_DK2_TILE_0,
             R_DK2_TILE_PATTERN_6, NULL, &cb_drp_finish, drp_lib_id);
         R_DK2_Activate(0, 0);
+
+        // reduction camera image
         memset(&param_resize_bilinear, 0, sizeof(param_resize_bilinear));
         param_resize_bilinear.src    = (uint32_t)fbuf_gray;
         param_resize_bilinear.dst    = (uint32_t)fbuf_work0;
@@ -319,6 +321,18 @@ static void drp_task(void) {
         param_resize_bilinear.dst_height = HEATMAP_PIXEL_VW;
         R_DK2_Start(drp_lib_id[0], (void *)&param_resize_bilinear, sizeof(r_drp_resize_bilinear_t));
         ThisThread::flags_wait_all(DRP_FLG_TILE_ALL);
+
+        // magnification sensor data
+        memset(&param_resize_bilinear, 0, sizeof(param_resize_bilinear));
+        param_resize_bilinear.src    = (uint32_t)sensor_raw_buffer;
+        param_resize_bilinear.dst    = (uint32_t)sensor_work_buffer;
+        param_resize_bilinear.src_width  = 4;
+        param_resize_bilinear.src_height = 4;
+        param_resize_bilinear.dst_width  = HEATMAP_PIXEL_HW;
+        param_resize_bilinear.dst_height = HEATMAP_PIXEL_VW;
+        R_DK2_Start(drp_lib_id[0], (void *)&param_resize_bilinear, sizeof(r_drp_resize_bilinear_t));
+        ThisThread::flags_wait_all(DRP_FLG_TILE_ALL);
+
         R_DK2_Unload(0, drp_lib_id);
 
         // MedianBlur
@@ -379,22 +393,6 @@ static void drp_task(void) {
         param_canny_hyst[0].work   = (uint32_t)drp_work_buf;
         param_canny_hyst[0].iterations = 2;
         R_DK2_Start(drp_lib_id[0], (void *)&param_canny_hyst[0], sizeof(r_drp_canny_hysterisis_t));
-        ThisThread::flags_wait_all(DRP_FLG_TILE_ALL);
-        R_DK2_Unload(0, drp_lib_id);
-
-        /* resize bilinear */
-        R_DK2_Load(g_drp_lib_resize_bilinear,
-            R_DK2_TILE_0,
-            R_DK2_TILE_PATTERN_6, NULL, &cb_drp_finish, drp_lib_id);
-        R_DK2_Activate(0, 0);
-        memset(&param_resize_bilinear, 0, sizeof(param_resize_bilinear));
-        param_resize_bilinear.src    = (uint32_t)sensor_raw_buffer;
-        param_resize_bilinear.dst    = (uint32_t)sensor_work_buffer;
-        param_resize_bilinear.src_width  = SENSOR_RAW_BUFFER_STRIDE;
-        param_resize_bilinear.src_height = SENSOR_RAW_BUFFER_HEIGHT;
-        param_resize_bilinear.dst_width  = HEATMAP_PIXEL_HW;
-        param_resize_bilinear.dst_height = HEATMAP_PIXEL_VW;
-        R_DK2_Start(drp_lib_id[0], (void *)&param_resize_bilinear, sizeof(r_drp_resize_bilinear_t));
         ThisThread::flags_wait_all(DRP_FLG_TILE_ALL);
         R_DK2_Unload(0, drp_lib_id);
 
