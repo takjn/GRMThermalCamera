@@ -36,6 +36,8 @@
 #include "DisplayApp.h"
 #include "JPEG_Converter.h"
 
+#include "opencv.hpp"
+
 #include "D6T_44L_06.h"
 #include "SHT30_DIS_B.h"
 #include "OPT3001DNP.h"
@@ -108,6 +110,11 @@ LIS2DW12 lis2dw(SPI_MOSI, SPI_MISO, SPI_SCKL, SPI_SSL); // [LIS2DW12]    : MEMS 
 
 static InterruptIn button0(USER_BUTTON0);
 static InterruptIn button1(USER_BUTTON1);
+
+// OpenCV test
+static cv::Mat img_argb(240, 320, CV_8UC4, sensor_result_buffer);
+static uint8_t buf_yuv[320 * 240 * 2]__attribute((aligned(32)));
+static cv::Mat img_yuv(240, 320, CV_8UC2, buf_yuv);
 
 /*******************************************************************************
 * Function Name: normalize0to1
@@ -236,6 +243,21 @@ static void Start_Video_Camera(void) {
 static void Start_LCD_Display(void) {
     DisplayBase::rect_t rect;
 
+    // // for camera image
+    // rect.vs = HEATMAP_PIXEL_VW;
+    // rect.vw = HEATMAP_PIXEL_VW;
+    // rect.hs = HEATMAP_PIXEL_HW;
+    // rect.hw = HEATMAP_PIXEL_HW;
+    // Display.Graphics_Read_Setting(
+    //     DisplayBase::GRAPHICS_LAYER_0,
+    //     (void *)fbuf_clat8,
+    //     SENSOR_WORK_BUFFER_STRIDE,
+    //     DisplayBase::GRAPHICS_FORMAT_CLUT8,
+    //     DisplayBase::WR_RD_WRSWA_32_16_8BIT,
+    //     &rect
+    // );
+    // Display.Graphics_Start(DisplayBase::GRAPHICS_LAYER_0);
+
     // for camera image
     rect.vs = HEATMAP_PIXEL_VW;
     rect.vw = HEATMAP_PIXEL_VW;
@@ -243,10 +265,10 @@ static void Start_LCD_Display(void) {
     rect.hw = HEATMAP_PIXEL_HW;
     Display.Graphics_Read_Setting(
         DisplayBase::GRAPHICS_LAYER_0,
-        (void *)fbuf_clat8,
+        (void *)buf_yuv,
         SENSOR_WORK_BUFFER_STRIDE,
-        DisplayBase::GRAPHICS_FORMAT_CLUT8,
-        DisplayBase::WR_RD_WRSWA_32_16_8BIT,
+        DisplayBase::GRAPHICS_FORMAT_YCBCR422,
+        DisplayBase::WR_RD_WRSWA_NON,
         &rect
     );
     Display.Graphics_Start(DisplayBase::GRAPHICS_LAYER_0);
@@ -441,6 +463,13 @@ static void drp_task(void) {
         if (Jcu.encode(&bitmap_buff_info, JpegBuffer, &encode_size, &encode_options) == JPEG_Converter::JPEG_CONV_OK) {
             display_app.SendJpeg(JpegBuffer, (int)encode_size);
         }
+
+        // Transform buffer into OpenCV matrix
+        cv::Mat img_rgb;
+        cv::cvtColor(img_argb, img_rgb, cv::COLOR_BGRA2RGB);
+        cv::cvtColor(img_rgb, img_yuv, cv::COLOR_RGB2YUV);
+        dcache_clean(buf_yuv, sizeof(buf_yuv));
+
         // display_app.SendRgb888(sensor_result_buffer, HEATMAP_PIXEL_HW, HEATMAP_PIXEL_VW);
     }
 }
