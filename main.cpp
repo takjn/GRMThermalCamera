@@ -30,6 +30,8 @@
 #include "r_drp_simple_isp.h"
 #include "r_drp_resize_bilinear.h"
 #include "dcache-control.h"
+#include "DisplayApp.h"
+
 #include "D6T_44L_06.h"
 #include "SHT30_DIS_B.h"
 #include "OPT3001DNP.h"
@@ -46,6 +48,7 @@
 #define VIDEO_PIXEL_VW         (720)    /* VGA */
 
 static DisplayBase Display;
+static DisplayApp  display_app;
 
 // Buffer for video
 #define FRAME_BUFFER_STRIDE    (((VIDEO_PIXEL_HW * 1) + 63u) & ~63u)
@@ -53,8 +56,6 @@ static DisplayBase Display;
 #define FRAME_BUFFER_HEIGHT    (VIDEO_PIXEL_VW)
 static uint8_t fbuf_bayer[FRAME_BUFFER_STRIDE * FRAME_BUFFER_HEIGHT]__attribute((aligned(128)));
 static uint8_t fbuf_yuv[FRAME_BUFFER_STRIDE_2 * FRAME_BUFFER_HEIGHT]__attribute((aligned(32)));
-static uint8_t fbuf_overlay[FRAME_BUFFER_STRIDE * FRAME_BUFFER_HEIGHT]__attribute((section("NC_BSS"),aligned(32)));
-static const uint32_t clut_data_resut[] = {0x00000000, 0xff000000};  // ARGB8888
 
 // Buffer for sensor data
 #define HEATMAP_PIXEL_HW         (320)    /* VGA */
@@ -233,7 +234,7 @@ static void Start_LCD_Display(void) {
         (void *)fbuf_yuv,
         FRAME_BUFFER_STRIDE_2,
         DisplayBase::GRAPHICS_FORMAT_YCBCR422,
-        DisplayBase::WR_RD_WRSWA_NON,
+        DisplayBase::WR_RD_WRSWA_32_16_8BIT,
         &rect
     );
     Display.Graphics_Start(DisplayBase::GRAPHICS_LAYER_0);
@@ -302,8 +303,8 @@ static void drp_task(void) {
         param_resize_bilinear.dst    = (uint32_t)fbuf_work_1;
         param_resize_bilinear.src_width  = 4;
         param_resize_bilinear.src_height = 4;
-        param_resize_bilinear.dst_width  = VIDEO_PIXEL_HW;
-        param_resize_bilinear.dst_height = VIDEO_PIXEL_VW;
+        param_resize_bilinear.dst_width  = HEATMAP_PIXEL_HW;
+        param_resize_bilinear.dst_height = HEATMAP_PIXEL_VW;
         R_DK2_Start(drp_lib_id[0], (void *)&param_resize_bilinear, sizeof(r_drp_resize_bilinear_t));
         ThisThread::flags_wait_all(DRP_FLG_TILE_ALL);
         R_DK2_Unload(0, drp_lib_id);
@@ -329,6 +330,8 @@ static void drp_task(void) {
             }
             j++;
         }
+
+        display_app.SendRgb888(fbuf_sensor_result, HEATMAP_PIXEL_HW, HEATMAP_PIXEL_VW);
     }
 }
 
