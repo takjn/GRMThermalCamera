@@ -34,6 +34,7 @@
 #include "r_drp_resize_bilinear.h"
 #include "dcache-control.h"
 #include "DisplayApp.h"
+#include "JPEG_Converter.h"
 
 #include "D6T_44L_06.h"
 #include "SHT30_DIS_B.h"
@@ -52,6 +53,7 @@
 
 static DisplayBase Display;
 static DisplayApp  display_app;
+static uint8_t JpegBuffer[1024 * 64]__attribute((aligned(32)));
 
 // Buffer for video
 #define FRAME_BUFFER_STRIDE    (((VIDEO_PIXEL_HW * 1) + 63u) & ~63u)
@@ -271,6 +273,19 @@ static void Start_LCD_Display(void) {
 static void drp_task(void) {
     uint32_t idx = 0;
 
+    JPEG_Converter  Jcu;
+    JPEG_Converter::bitmap_buff_info_t bitmap_buff_info;
+    JPEG_Converter::encode_options_t   encode_options;
+    size_t encode_size;
+    bitmap_buff_info.width              = HEATMAP_PIXEL_HW;
+    bitmap_buff_info.height             = HEATMAP_PIXEL_VW;
+    bitmap_buff_info.format             = JPEG_Converter::WR_RD_ARGB8888;
+    bitmap_buff_info.buffer_address     = (void *)sensor_result_buffer;
+    encode_options.encode_buff_size     = sizeof(JpegBuffer);
+    encode_options.input_swapsetting    = JPEG_Converter::WR_RD_WRSWA_NON;
+    encode_options.height = HEATMAP_PIXEL_HW;
+    encode_options.width = HEATMAP_PIXEL_VW;
+
     EasyAttach_Init(Display);
     // Interrupt callback function setting (Field end signal for recording function in scaler 0)
     Display.Graphics_Irq_Handler_Set(DisplayBase::INT_TYPE_S0_VFIELD, 0, IntCallbackFunc_Vfield);
@@ -422,7 +437,11 @@ static void drp_task(void) {
             j++;
         }
 
-        display_app.SendRgb888(sensor_result_buffer, HEATMAP_PIXEL_HW, HEATMAP_PIXEL_VW);
+        dcache_invalid(JpegBuffer, sizeof(JpegBuffer));
+        if (Jcu.encode(&bitmap_buff_info, JpegBuffer, &encode_size, &encode_options) == JPEG_Converter::JPEG_CONV_OK) {
+            display_app.SendJpeg(JpegBuffer, (int)encode_size);
+        }
+        // display_app.SendRgb888(sensor_result_buffer, HEATMAP_PIXEL_HW, HEATMAP_PIXEL_VW);
     }
 }
 
