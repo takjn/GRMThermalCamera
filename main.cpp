@@ -27,7 +27,10 @@
 #include "EasyAttach_CameraAndLCD.h"
 #include "AsciiFont.h"
 #include "r_dk2_if.h"
-#include "r_drp_simple_isp.h"
+#include "r_drp_bayer2grayscale.h"
+#include "r_drp_median_blur.h"
+#include "r_drp_canny_calculate.h"
+#include "r_drp_canny_hysterisis.h"
 #include "r_drp_resize_bilinear.h"
 #include "dcache-control.h"
 #include "DisplayApp.h"
@@ -52,10 +55,9 @@ static DisplayApp  display_app;
 
 // Buffer for video
 #define FRAME_BUFFER_STRIDE    (((VIDEO_PIXEL_HW * 1) + 63u) & ~63u)
-#define FRAME_BUFFER_STRIDE_2  (((VIDEO_PIXEL_HW * 2) + 31u) & ~31u)
 #define FRAME_BUFFER_HEIGHT    (VIDEO_PIXEL_VW)
 static uint8_t fbuf_bayer[FRAME_BUFFER_STRIDE * FRAME_BUFFER_HEIGHT]__attribute((aligned(128)));
-static uint8_t fbuf_yuv[FRAME_BUFFER_STRIDE_2 * FRAME_BUFFER_HEIGHT]__attribute((aligned(32)));
+static uint8_t fbuf_gray[FRAME_BUFFER_STRIDE * FRAME_BUFFER_HEIGHT]__attribute((aligned(32)));
 
 // Buffer for sensor data
 #define HEATMAP_PIXEL_HW         (320)    /* VGA */
@@ -65,16 +67,24 @@ static uint8_t fbuf_yuv[FRAME_BUFFER_STRIDE_2 * FRAME_BUFFER_HEIGHT]__attribute(
 #define SENSOR_RAW_BUFFER_HEIGHT    (4)
 #define SENSOR_WORK_BUFFER_STRIDE    (((HEATMAP_PIXEL_HW * 1) + 31u) & ~31u)
 #define SENSOR_RESULT_BUFFER_STRIDE  (((HEATMAP_PIXEL_HW * 4) + 31u) & ~31u)
-static uint8_t fbuf_work_0[SENSOR_RAW_BUFFER_STRIDE * SENSOR_RAW_BUFFER_HEIGHT]__attribute((section("NC_BSS")));
-static uint8_t fbuf_work_1[SENSOR_WORK_BUFFER_STRIDE * HEATMAP_PIXEL_VW]__attribute((section("NC_BSS")));
-uint8_t fbuf_sensor_result[SENSOR_RESULT_BUFFER_STRIDE * HEATMAP_PIXEL_VW]__attribute((section("NC_BSS")));
+#define SENSOR_RESULT_BUFFER_HEIGHT  (HEATMAP_PIXEL_VW)
+static uint8_t sensor_raw_buffer[SENSOR_RAW_BUFFER_STRIDE * SENSOR_RAW_BUFFER_HEIGHT]__attribute((section("NC_BSS")));
+static uint8_t sensor_work_buffer[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("NC_BSS")));
+uint8_t sensor_result_buffer[SENSOR_RESULT_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("NC_BSS")));
+
+
+static uint8_t fbuf_work0[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((aligned(32)));
+static uint8_t fbuf_work1[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((aligned(32)));
+static uint8_t fbuf_clat8[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((aligned(32)));
+static uint8_t drp_work_buf[((SENSOR_WORK_BUFFER_STRIDE * ((SENSOR_RESULT_BUFFER_HEIGHT / 3) + 2)) * 2) * 3]__attribute((section("NC_BSS")));
+
 
 // Variables for DRP
 #define DRP_FLG_TILE_ALL       (R_DK2_TILE_0 | R_DK2_TILE_1 | R_DK2_TILE_2 | R_DK2_TILE_3 | R_DK2_TILE_4 | R_DK2_TILE_5)
 #define DRP_FLG_CAMER_IN       (0x00000100)
 static uint8_t drp_lib_id[R_DK2_TILE_NUM] = {0};
 static Thread drpTask(osPriorityHigh, 1024*8);
-static r_drp_simple_isp_t param_isp __attribute((section("NC_BSS")));
+static uint8_t nc_memory[512] __attribute((section("NC_BSS")));
 static r_drp_resize_bilinear_t param_resize_bilinear __attribute((section("NC_BSS")));
 
 // Variables for omron sensor
@@ -225,15 +235,15 @@ static void Start_LCD_Display(void) {
     DisplayBase::rect_t rect;
 
     // for camera image
-    rect.vs = 0;
-    rect.vw = VIDEO_PIXEL_VW;
-    rect.hs = 0;
-    rect.hw = VIDEO_PIXEL_HW;
+    rect.vs = HEATMAP_PIXEL_VW;
+    rect.vw = HEATMAP_PIXEL_VW;
+    rect.hs = HEATMAP_PIXEL_HW;
+    rect.hw = HEATMAP_PIXEL_HW;
     Display.Graphics_Read_Setting(
         DisplayBase::GRAPHICS_LAYER_0,
-        (void *)fbuf_yuv,
-        FRAME_BUFFER_STRIDE_2,
-        DisplayBase::GRAPHICS_FORMAT_YCBCR422,
+        (void *)fbuf_clat8,
+        SENSOR_WORK_BUFFER_STRIDE,
+        DisplayBase::GRAPHICS_FORMAT_CLUT8,
         DisplayBase::WR_RD_WRSWA_32_16_8BIT,
         &rect
     );
@@ -246,7 +256,7 @@ static void Start_LCD_Display(void) {
     rect.hw = HEATMAP_PIXEL_HW;
     Display.Graphics_Read_Setting(
         DisplayBase::GRAPHICS_LAYER_2,
-        (void *)fbuf_sensor_result,
+        (void *)sensor_result_buffer,
         SENSOR_RESULT_BUFFER_STRIDE,
         DisplayBase::GRAPHICS_FORMAT_ARGB8888,
         DisplayBase::WR_RD_WRSWA_NON,
@@ -259,6 +269,8 @@ static void Start_LCD_Display(void) {
 }
 
 static void drp_task(void) {
+    uint32_t idx = 0;
+
     EasyAttach_Init(Display);
     // Interrupt callback function setting (Field end signal for recording function in scaler 0)
     Display.Graphics_Irq_Handler_Set(DisplayBase::INT_TYPE_S0_VFIELD, 0, IntCallbackFunc_Vfield);
@@ -268,28 +280,105 @@ static void drp_task(void) {
     R_DK2_Initialize();
 
     char str[64];
-    AsciiFont ascii_font(fbuf_sensor_result, HEATMAP_PIXEL_HW, HEATMAP_PIXEL_VW, SENSOR_RESULT_BUFFER_STRIDE, 4);
+    AsciiFont ascii_font(sensor_result_buffer, HEATMAP_PIXEL_HW, HEATMAP_PIXEL_VW, SENSOR_RESULT_BUFFER_STRIDE, 4);
 
     while (true) {
         ThisThread::flags_wait_all(DRP_FLG_CAMER_IN);
 
-        /* SimpleIsp bayer2yuv_6 */
-        R_DK2_Load(g_drp_lib_simple_isp_bayer2yuv_6,
+        // Bayer2Grayscale
+        R_DK2_Load(
+                   g_drp_lib_bayer2grayscale,
+                   R_DK2_TILE_0 | R_DK2_TILE_1 | R_DK2_TILE_2 | R_DK2_TILE_3 | R_DK2_TILE_4 | R_DK2_TILE_5,
+                   R_DK2_TILE_PATTERN_1_1_1_1_1_1, NULL, &cb_drp_finish, drp_lib_id);
+        R_DK2_Activate(0, 0);
+
+        r_drp_bayer2grayscale_t * param_b2g = (r_drp_bayer2grayscale_t *)nc_memory;
+        for (idx = 0; idx < R_DK2_TILE_NUM; idx++) {
+            param_b2g[idx].src    = (uint32_t)fbuf_bayer + (VIDEO_PIXEL_HW * (VIDEO_PIXEL_VW / R_DK2_TILE_NUM) * idx);
+            param_b2g[idx].dst    = (uint32_t)fbuf_gray + (VIDEO_PIXEL_HW * (VIDEO_PIXEL_VW / R_DK2_TILE_NUM) * idx);
+            param_b2g[idx].width  = VIDEO_PIXEL_HW;
+            param_b2g[idx].height = VIDEO_PIXEL_VW / R_DK2_TILE_NUM;
+            param_b2g[idx].top    = (idx == 0) ? 1 : 0;
+            param_b2g[idx].bottom = (idx == 5) ? 1 : 0;
+            R_DK2_Start(drp_lib_id[idx], (void *)&param_b2g[idx], sizeof(r_drp_bayer2grayscale_t));
+        }
+        ThisThread::flags_wait_all(DRP_FLG_TILE_ALL);
+        R_DK2_Unload(0, drp_lib_id);
+
+        // resize bilinear
+        R_DK2_Load(g_drp_lib_resize_bilinear,
             R_DK2_TILE_0,
             R_DK2_TILE_PATTERN_6, NULL, &cb_drp_finish, drp_lib_id);
         R_DK2_Activate(0, 0);
-        memset(&param_isp, 0, sizeof(param_isp));
-        param_isp.src    = (uint32_t)fbuf_bayer;
-        param_isp.dst    = (uint32_t)fbuf_yuv;
-        param_isp.width  = VIDEO_PIXEL_HW;
-        param_isp.height = VIDEO_PIXEL_VW;
-        param_isp.gain_r = 0x1800;
-        param_isp.gain_g = 0x1000;
-        param_isp.gain_b = 0x1C00;
-        param_isp.bias_r = 0;
-        param_isp.bias_g = 0;
-        param_isp.bias_b = 0;
-        R_DK2_Start(drp_lib_id[0], (void *)&param_isp, sizeof(r_drp_simple_isp_t));
+        memset(&param_resize_bilinear, 0, sizeof(param_resize_bilinear));
+        param_resize_bilinear.src    = (uint32_t)fbuf_gray;
+        param_resize_bilinear.dst    = (uint32_t)fbuf_work0;
+        param_resize_bilinear.src_width  = VIDEO_PIXEL_HW;
+        param_resize_bilinear.src_height = VIDEO_PIXEL_VW;
+        param_resize_bilinear.dst_width  = HEATMAP_PIXEL_HW;
+        param_resize_bilinear.dst_height = HEATMAP_PIXEL_VW;
+        R_DK2_Start(drp_lib_id[0], (void *)&param_resize_bilinear, sizeof(r_drp_resize_bilinear_t));
+        ThisThread::flags_wait_all(DRP_FLG_TILE_ALL);
+        R_DK2_Unload(0, drp_lib_id);
+
+        // MedianBlur
+        R_DK2_Load(
+                   g_drp_lib_median_blur,
+                   R_DK2_TILE_0 | R_DK2_TILE_1 | R_DK2_TILE_2 | R_DK2_TILE_3 | R_DK2_TILE_4 | R_DK2_TILE_5,
+                   R_DK2_TILE_PATTERN_1_1_1_1_1_1, NULL, &cb_drp_finish, drp_lib_id);
+        R_DK2_Activate(0, 0);
+
+        r_drp_median_blur_t * param_median = (r_drp_median_blur_t *)nc_memory;
+        for (idx = 0; idx < R_DK2_TILE_NUM; idx++) {
+            param_median[idx].src    = (uint32_t)fbuf_work0 + (HEATMAP_PIXEL_HW * (HEATMAP_PIXEL_VW / R_DK2_TILE_NUM) * idx);
+            param_median[idx].dst    = (uint32_t)fbuf_work1 + (HEATMAP_PIXEL_HW * (HEATMAP_PIXEL_VW / R_DK2_TILE_NUM) * idx);
+            param_median[idx].width  = HEATMAP_PIXEL_HW;
+            param_median[idx].height = HEATMAP_PIXEL_VW / R_DK2_TILE_NUM;
+            param_median[idx].top    = (idx == 0) ? 1 : 0;
+            param_median[idx].bottom = (idx == 5) ? 1 : 0;
+            R_DK2_Start(drp_lib_id[idx], (void *)&param_median[idx], sizeof(r_drp_median_blur_t));
+        }
+        ThisThread::flags_wait_all(DRP_FLG_TILE_ALL);
+        R_DK2_Unload(0, drp_lib_id);
+
+        // CannyCalculate
+        R_DK2_Load(
+                   g_drp_lib_canny_calculate,
+                   R_DK2_TILE_0 | R_DK2_TILE_2 | R_DK2_TILE_4,
+                   R_DK2_TILE_PATTERN_2_2_2, NULL, &cb_drp_finish, drp_lib_id);
+        R_DK2_Activate(0, 0);
+
+        r_drp_canny_calculate_t * param_canny_cal = (r_drp_canny_calculate_t *)nc_memory;
+        for (idx = 0; idx < 3; idx++) {
+            param_canny_cal[idx].src    = (uint32_t)fbuf_work1 + (HEATMAP_PIXEL_HW * (HEATMAP_PIXEL_VW / 3) * idx);
+            param_canny_cal[idx].dst    = (uint32_t)fbuf_work0 + (HEATMAP_PIXEL_HW * (HEATMAP_PIXEL_VW / 3) * idx);
+            param_canny_cal[idx].width  = HEATMAP_PIXEL_HW;
+            param_canny_cal[idx].height = (HEATMAP_PIXEL_VW / 3);
+            param_canny_cal[idx].top    = ((idx * 2) == 0) ? 1 : 0;
+            param_canny_cal[idx].bottom = ((idx * 2) == 4) ? 1 : 0;
+            param_canny_cal[idx].work   = (uint32_t)&drp_work_buf[((HEATMAP_PIXEL_HW * ((HEATMAP_PIXEL_VW / 3) + 2)) * 2) * idx];
+            param_canny_cal[idx].threshold_high = 0x28;
+            param_canny_cal[idx].threshold_low  = 0x18;
+            R_DK2_Start(drp_lib_id[(idx * 2)], (void *)&param_canny_cal[idx], sizeof(r_drp_canny_calculate_t));
+        }
+        ThisThread::flags_wait_all(DRP_FLG_TILE_ALL);
+        R_DK2_Unload(0, drp_lib_id);
+
+        // CannyHysterisis
+        R_DK2_Load(
+                   g_drp_lib_canny_hysterisis,
+                   R_DK2_TILE_0,
+                   R_DK2_TILE_PATTERN_6, NULL, &cb_drp_finish, drp_lib_id);
+        R_DK2_Activate(0, 0);
+
+        r_drp_canny_hysterisis_t * param_canny_hyst = (r_drp_canny_hysterisis_t *)nc_memory;
+        param_canny_hyst[0].src    = (uint32_t)fbuf_work0;
+        param_canny_hyst[0].dst    = (uint32_t)fbuf_clat8;
+        param_canny_hyst[0].width  = HEATMAP_PIXEL_HW;
+        param_canny_hyst[0].height = HEATMAP_PIXEL_VW;
+        param_canny_hyst[0].work   = (uint32_t)drp_work_buf;
+        param_canny_hyst[0].iterations = 2;
+        R_DK2_Start(drp_lib_id[0], (void *)&param_canny_hyst[0], sizeof(r_drp_canny_hysterisis_t));
         ThisThread::flags_wait_all(DRP_FLG_TILE_ALL);
         R_DK2_Unload(0, drp_lib_id);
 
@@ -299,10 +388,10 @@ static void drp_task(void) {
             R_DK2_TILE_PATTERN_6, NULL, &cb_drp_finish, drp_lib_id);
         R_DK2_Activate(0, 0);
         memset(&param_resize_bilinear, 0, sizeof(param_resize_bilinear));
-        param_resize_bilinear.src    = (uint32_t)fbuf_work_0;
-        param_resize_bilinear.dst    = (uint32_t)fbuf_work_1;
-        param_resize_bilinear.src_width  = 4;
-        param_resize_bilinear.src_height = 4;
+        param_resize_bilinear.src    = (uint32_t)sensor_raw_buffer;
+        param_resize_bilinear.dst    = (uint32_t)sensor_work_buffer;
+        param_resize_bilinear.src_width  = SENSOR_RAW_BUFFER_STRIDE;
+        param_resize_bilinear.src_height = SENSOR_RAW_BUFFER_HEIGHT;
         param_resize_bilinear.dst_width  = HEATMAP_PIXEL_HW;
         param_resize_bilinear.dst_height = HEATMAP_PIXEL_VW;
         R_DK2_Start(drp_lib_id[0], (void *)&param_resize_bilinear, sizeof(r_drp_resize_bilinear_t));
@@ -322,16 +411,16 @@ static void drp_task(void) {
             }
         }
 
-        uint32_t *p = (uint32_t*)fbuf_sensor_result;
+        uint32_t *p = (uint32_t*)sensor_result_buffer;
         uint j=0;
-        for (uint i=0;i<sizeof(fbuf_work_1);i++) {
+        for (uint i=0;i<sizeof(sensor_work_buffer);i++) {
             if (p[j] != 0xFFFFFFFF) {
-                p[j] = colors[fbuf_work_1[i]];
+                p[j] = colors[sensor_work_buffer[i]];
             }
             j++;
         }
 
-        display_app.SendRgb888(fbuf_sensor_result, HEATMAP_PIXEL_HW, HEATMAP_PIXEL_VW);
+        display_app.SendRgb888(sensor_result_buffer, HEATMAP_PIXEL_HW, HEATMAP_PIXEL_VW);
     }
 }
 
@@ -360,7 +449,7 @@ static void sensor_task(void) {
         }
         for (int i = 0; i < 16; i++) {
             uint8_t a = (normalize0to1(buf[i], pdta - TILE_TEMP_MARGIN_UNDER,  pdta + TILE_TEMP_MARGIN_UPPER) * 255.0);
-            fbuf_work_0[i]=a;
+            sensor_raw_buffer[i]=a;
         }
 
         // printf("\x1b[%d;%dH", 0, 0);  // Move cursor (y , x)
