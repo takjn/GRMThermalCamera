@@ -415,7 +415,11 @@ static void drp_task(void) {
         uint j=0;
         for (uint i=0;i<sizeof(sensor_work_buffer);i++) {
             if (p[j] != 0xFFFFFFFF) {
-                p[j] = colors[sensor_work_buffer[i]];
+                if (fbuf_clat8[i] == 0xFF) {
+                    p[j] = 0xFF000000;
+                } else {
+                    p[j] = colors[sensor_work_buffer[i]];
+                }
             }
             j++;
         }
