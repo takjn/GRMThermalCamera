@@ -34,6 +34,7 @@
 #include "r_drp_resize_bilinear.h"
 #include "dcache-control.h"
 #include "DisplayApp.h"
+#include "JPEG_Converter.h"
 
 #include "D6T_44L_06.h"
 #include "SHT30_DIS_B.h"
@@ -47,11 +48,12 @@
 
 /*! Frame buffer stride: Frame buffer stride should be set to a multiple of 32 or 128
     in accordance with the frame buffer burst transfer mode. */
-#define VIDEO_PIXEL_HW         (1280)    /* VGA */
-#define VIDEO_PIXEL_VW         (720)    /* VGA */
+#define VIDEO_PIXEL_HW         (1280)
+#define VIDEO_PIXEL_VW         (720)
 
 static DisplayBase Display;
 static DisplayApp  display_app;
+static uint8_t JpegBuffer[1024 * 64]__attribute((aligned(32)));
 
 // Buffer for video
 #define FRAME_BUFFER_STRIDE    (((VIDEO_PIXEL_HW * 1) + 63u) & ~63u)
@@ -60,8 +62,8 @@ static uint8_t fbuf_bayer[FRAME_BUFFER_STRIDE * FRAME_BUFFER_HEIGHT]__attribute(
 static uint8_t fbuf_gray[FRAME_BUFFER_STRIDE * FRAME_BUFFER_HEIGHT]__attribute((aligned(32)));
 
 // Buffer for sensor data
-#define HEATMAP_PIXEL_HW         (320)    /* VGA */
-#define HEATMAP_PIXEL_VW         (240)    /* VGA */
+#define HEATMAP_PIXEL_HW         (320)
+#define HEATMAP_PIXEL_VW         (240)
 
 #define SENSOR_RAW_BUFFER_STRIDE    (((4 * 1) + 31u) & ~31u)
 #define SENSOR_RAW_BUFFER_HEIGHT    (4)
@@ -69,14 +71,25 @@ static uint8_t fbuf_gray[FRAME_BUFFER_STRIDE * FRAME_BUFFER_HEIGHT]__attribute((
 #define SENSOR_RESULT_BUFFER_STRIDE  (((HEATMAP_PIXEL_HW * 4) + 31u) & ~31u)
 #define SENSOR_RESULT_BUFFER_HEIGHT  (HEATMAP_PIXEL_VW)
 static uint8_t sensor_raw_buffer[SENSOR_RAW_BUFFER_STRIDE * SENSOR_RAW_BUFFER_HEIGHT]__attribute((section("NC_BSS")));
-static uint8_t sensor_work_buffer[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("NC_BSS")));
-uint8_t sensor_result_buffer[SENSOR_RESULT_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("NC_BSS")));
+static uint8_t sensor_work_buffer[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("OCTA_BSS"),aligned(32)));
+uint8_t sensor_result_buffer[SENSOR_RESULT_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("OCTA_BSS"),aligned(32)));
 
-
-static uint8_t fbuf_work0[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((aligned(32)));
-static uint8_t fbuf_work1[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((aligned(32)));
+static uint8_t fbuf_work0[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("OCTA_BSS"),aligned(32)));
+static uint8_t fbuf_work1[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("OCTA_BSS"),aligned(32)));
 static uint8_t fbuf_clat8[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((aligned(32)));
 static uint8_t drp_work_buf[((SENSOR_WORK_BUFFER_STRIDE * ((SENSOR_RESULT_BUFFER_HEIGHT / 3) + 2)) * 2) * 3]__attribute((section("NC_BSS")));
+
+#define SENSOR_WORK_BUFFER_STRIDE_2  (((HEATMAP_PIXEL_HW * 2) + 31u) & ~31u)
+static uint8_t fbuf_yuv[SENSOR_WORK_BUFFER_STRIDE_2 * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((aligned(32)));
+
+// RGB to YUV convertion
+// https://stackoverflow.com/questions/1737726/how-to-perform-rgb-yuv-conversion-in-c-c
+#define CLIP(X) ( (X) > 255 ? 255 : (X) < 0 ? 0 : X)
+
+// RGB -> YUV
+#define RGB2Y(R, G, B) CLIP(( (  66 * (R) + 129 * (G) +  25 * (B) + 128) >> 8) +  16)
+#define RGB2U(R, G, B) CLIP(( ( -38 * (R) -  74 * (G) + 112 * (B) + 128) >> 8) + 128)
+#define RGB2V(R, G, B) CLIP(( ( 112 * (R) -  94 * (G) -  18 * (B) + 128) >> 8) + 128)
 
 
 // Variables for DRP
@@ -240,14 +253,14 @@ static void Start_LCD_Display(void) {
     rect.hs = HEATMAP_PIXEL_HW;
     rect.hw = HEATMAP_PIXEL_HW;
     Display.Graphics_Read_Setting(
-        DisplayBase::GRAPHICS_LAYER_0,
+        DisplayBase::GRAPHICS_LAYER_2,
         (void *)fbuf_clat8,
         SENSOR_WORK_BUFFER_STRIDE,
         DisplayBase::GRAPHICS_FORMAT_CLUT8,
         DisplayBase::WR_RD_WRSWA_32_16_8BIT,
         &rect
     );
-    Display.Graphics_Start(DisplayBase::GRAPHICS_LAYER_0);
+    Display.Graphics_Start(DisplayBase::GRAPHICS_LAYER_2);
 
     // for sensor image
     rect.vs = 0;
@@ -255,14 +268,14 @@ static void Start_LCD_Display(void) {
     rect.hs = 0;
     rect.hw = HEATMAP_PIXEL_HW;
     Display.Graphics_Read_Setting(
-        DisplayBase::GRAPHICS_LAYER_2,
-        (void *)sensor_result_buffer,
-        SENSOR_RESULT_BUFFER_STRIDE,
-        DisplayBase::GRAPHICS_FORMAT_ARGB8888,
-        DisplayBase::WR_RD_WRSWA_NON,
+        DisplayBase::GRAPHICS_LAYER_0,
+        (void *)fbuf_yuv,
+        SENSOR_WORK_BUFFER_STRIDE_2,
+        DisplayBase::GRAPHICS_FORMAT_YCBCR422,
+        DisplayBase::WR_RD_WRSWA_32_16_8BIT,
         &rect
     );
-    Display.Graphics_Start(DisplayBase::GRAPHICS_LAYER_2);
+    Display.Graphics_Start(DisplayBase::GRAPHICS_LAYER_0);
 
     ThisThread::sleep_for(50);
     EasyAttach_LcdBacklight(true);
@@ -270,6 +283,19 @@ static void Start_LCD_Display(void) {
 
 static void drp_task(void) {
     uint32_t idx = 0;
+
+    JPEG_Converter  Jcu;
+    JPEG_Converter::bitmap_buff_info_t bitmap_buff_info;
+    JPEG_Converter::encode_options_t   encode_options;
+    size_t encode_size;
+    bitmap_buff_info.width              = HEATMAP_PIXEL_HW;
+    bitmap_buff_info.height             = HEATMAP_PIXEL_VW;
+    bitmap_buff_info.format             = JPEG_Converter::WR_RD_YCbCr422;
+    bitmap_buff_info.buffer_address     = (void *)fbuf_yuv;
+    encode_options.encode_buff_size     = sizeof(JpegBuffer);
+    encode_options.input_swapsetting    = JPEG_Converter::WR_RD_WRSWA_32_16BIT;  //WR_RD_WRSWA_32BIT
+    encode_options.width = HEATMAP_PIXEL_HW;
+    encode_options.height = HEATMAP_PIXEL_VW;
 
     EasyAttach_Init(Display);
     // Interrupt callback function setting (Field end signal for recording function in scaler 0)
@@ -422,7 +448,31 @@ static void drp_task(void) {
             j++;
         }
 
-        display_app.SendRgb888(sensor_result_buffer, HEATMAP_PIXEL_HW, HEATMAP_PIXEL_VW);
+        // convert RGB to YUV for JCU
+        for (uint i=0;i<sizeof(fbuf_yuv);i+=4) {
+            uint8_t r1 = sensor_result_buffer[i*2+2];
+            uint8_t g1 = sensor_result_buffer[i*2+1];
+            uint8_t b1 = sensor_result_buffer[i*2+0];
+            uint8_t r2 = sensor_result_buffer[i*2+6];
+            uint8_t g2 = sensor_result_buffer[i*2+5];
+            uint8_t b2 = sensor_result_buffer[i*2+4];
+
+            uint8_t y1 = RGB2Y(r1, g1, b1);
+            uint8_t u1 = RGB2U(r1, g1, b1);
+            uint8_t v1 = RGB2V(r1, g1, b1);
+            uint8_t y2 = RGB2Y(r2, g2, b2);
+
+            fbuf_yuv[i+0]=u1; // u
+            fbuf_yuv[i+1]=y1; // y
+            fbuf_yuv[i+2]=v1; // v
+            fbuf_yuv[i+3]=y2; // y
+        }
+        dcache_clean(fbuf_yuv, sizeof(fbuf_yuv));
+
+        dcache_invalid(JpegBuffer, sizeof(JpegBuffer));
+        if (Jcu.encode(&bitmap_buff_info, JpegBuffer, &encode_size, &encode_options) == JPEG_Converter::JPEG_CONV_OK) {
+            display_app.SendJpeg(JpegBuffer, (int)encode_size);
+        }
     }
 }
 
