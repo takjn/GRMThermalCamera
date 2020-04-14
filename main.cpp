@@ -74,15 +74,23 @@ static uint8_t sensor_raw_buffer[SENSOR_RAW_BUFFER_STRIDE * SENSOR_RAW_BUFFER_HE
 static uint8_t sensor_work_buffer[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("NC_BSS")));
 uint8_t sensor_result_buffer[SENSOR_RESULT_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("NC_BSS")));
 
-
 static uint8_t fbuf_work0[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((aligned(32)));
 static uint8_t fbuf_work1[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((aligned(32)));
 static uint8_t fbuf_clat8[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((aligned(32)));
 static uint8_t drp_work_buf[((SENSOR_WORK_BUFFER_STRIDE * ((SENSOR_RESULT_BUFFER_HEIGHT / 3) + 2)) * 2) * 3]__attribute((section("NC_BSS")));
 
-
 #define SENSOR_WORK_BUFFER_STRIDE_2  (((HEATMAP_PIXEL_HW * 2) + 31u) & ~31u)
 static uint8_t fbuf_yuv[SENSOR_WORK_BUFFER_STRIDE_2 * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((aligned(32)));
+
+// RGB to YUV convertion
+// https://stackoverflow.com/questions/1737726/how-to-perform-rgb-yuv-conversion-in-c-c
+#define CLIP(X) ( (X) > 255 ? 255 : (X) < 0 ? 0 : X)
+
+// RGB -> YUV
+#define RGB2Y(R, G, B) CLIP(( (  66 * (R) + 129 * (G) +  25 * (B) + 128) >> 8) +  16)
+#define RGB2U(R, G, B) CLIP(( ( -38 * (R) -  74 * (G) + 112 * (B) + 128) >> 8) + 128)
+#define RGB2V(R, G, B) CLIP(( ( 112 * (R) -  94 * (G) -  18 * (B) + 128) >> 8) + 128)
+
 
 // Variables for DRP
 #define DRP_FLG_TILE_ALL       (R_DK2_TILE_0 | R_DK2_TILE_1 | R_DK2_TILE_2 | R_DK2_TILE_3 | R_DK2_TILE_4 | R_DK2_TILE_5)
@@ -239,31 +247,16 @@ static void Start_Video_Camera(void) {
 static void Start_LCD_Display(void) {
     DisplayBase::rect_t rect;
 
-    // // for camera image
-    // rect.vs = HEATMAP_PIXEL_VW;
-    // rect.vw = HEATMAP_PIXEL_VW;
-    // rect.hs = HEATMAP_PIXEL_HW;
-    // rect.hw = HEATMAP_PIXEL_HW;
-    // Display.Graphics_Read_Setting(
-    //     DisplayBase::GRAPHICS_LAYER_0,
-    //     (void *)fbuf_clat8,
-    //     SENSOR_WORK_BUFFER_STRIDE,
-    //     DisplayBase::GRAPHICS_FORMAT_CLUT8,
-    //     DisplayBase::WR_RD_WRSWA_32_16_8BIT,
-    //     &rect
-    // );
-    // Display.Graphics_Start(DisplayBase::GRAPHICS_LAYER_0);
-
     // for camera image
-    rect.vs = HEATMAP_PIXEL_VW;
+    rect.vs = 0;
     rect.vw = HEATMAP_PIXEL_VW;
     rect.hs = HEATMAP_PIXEL_HW;
     rect.hw = HEATMAP_PIXEL_HW;
     Display.Graphics_Read_Setting(
         DisplayBase::GRAPHICS_LAYER_0,
-        (void *)fbuf_yuv,
-        SENSOR_WORK_BUFFER_STRIDE_2,
-        DisplayBase::GRAPHICS_FORMAT_YCBCR422,
+        (void *)fbuf_clat8,
+        SENSOR_WORK_BUFFER_STRIDE,
+        DisplayBase::GRAPHICS_FORMAT_CLUT8,
         DisplayBase::WR_RD_WRSWA_32_16_8BIT,
         &rect
     );
@@ -276,10 +269,10 @@ static void Start_LCD_Display(void) {
     rect.hw = HEATMAP_PIXEL_HW;
     Display.Graphics_Read_Setting(
         DisplayBase::GRAPHICS_LAYER_2,
-        (void *)sensor_result_buffer,
-        SENSOR_RESULT_BUFFER_STRIDE,
-        DisplayBase::GRAPHICS_FORMAT_ARGB8888,
-        DisplayBase::WR_RD_WRSWA_NON,
+        (void *)fbuf_yuv,
+        SENSOR_WORK_BUFFER_STRIDE_2,
+        DisplayBase::GRAPHICS_FORMAT_YCBCR422,
+        DisplayBase::WR_RD_WRSWA_32_16_8BIT,
         &rect
     );
     Display.Graphics_Start(DisplayBase::GRAPHICS_LAYER_2);
@@ -287,14 +280,6 @@ static void Start_LCD_Display(void) {
     ThisThread::sleep_for(50);
     EasyAttach_LcdBacklight(true);
 }
-
-// https://stackoverflow.com/questions/1737726/how-to-perform-rgb-yuv-conversion-in-c-c
-#define CLIP(X) ( (X) > 255 ? 255 : (X) < 0 ? 0 : X)
-
-// RGB -> YUV
-#define RGB2Y(R, G, B) CLIP(( (  66 * (R) + 129 * (G) +  25 * (B) + 128) >> 8) +  16)
-#define RGB2U(R, G, B) CLIP(( ( -38 * (R) -  74 * (G) + 112 * (B) + 128) >> 8) + 128)
-#define RGB2V(R, G, B) CLIP(( ( 112 * (R) -  94 * (G) -  18 * (B) + 128) >> 8) + 128)
 
 static void drp_task(void) {
     uint32_t idx = 0;
@@ -463,6 +448,7 @@ static void drp_task(void) {
             j++;
         }
 
+        // convert RGB to YUV for JCU
         for (uint i=0;i<sizeof(fbuf_yuv);i+=4) {
             uint8_t r1 = sensor_result_buffer[i*2+2];
             uint8_t g1 = sensor_result_buffer[i*2+1];
@@ -487,8 +473,6 @@ static void drp_task(void) {
         if (Jcu.encode(&bitmap_buff_info, JpegBuffer, &encode_size, &encode_options) == JPEG_Converter::JPEG_CONV_OK) {
             display_app.SendJpeg(JpegBuffer, (int)encode_size);
         }
-
-        // display_app.SendRgb888(sensor_result_buffer, HEATMAP_PIXEL_HW, HEATMAP_PIXEL_VW);
     }
 }
 
