@@ -36,8 +36,6 @@
 #include "DisplayApp.h"
 #include "JPEG_Converter.h"
 
-#include "opencv.hpp"
-
 #include "D6T_44L_06.h"
 #include "SHT30_DIS_B.h"
 #include "OPT3001DNP.h"
@@ -83,6 +81,9 @@ static uint8_t fbuf_clat8[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGH
 static uint8_t drp_work_buf[((SENSOR_WORK_BUFFER_STRIDE * ((SENSOR_RESULT_BUFFER_HEIGHT / 3) + 2)) * 2) * 3]__attribute((section("NC_BSS")));
 
 
+#define SENSOR_WORK_BUFFER_STRIDE_2  (((HEATMAP_PIXEL_HW * 2) + 31u) & ~31u)
+static uint8_t fbuf_yuv[SENSOR_WORK_BUFFER_STRIDE_2 * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((aligned(32)));
+
 // Variables for DRP
 #define DRP_FLG_TILE_ALL       (R_DK2_TILE_0 | R_DK2_TILE_1 | R_DK2_TILE_2 | R_DK2_TILE_3 | R_DK2_TILE_4 | R_DK2_TILE_5)
 #define DRP_FLG_CAMER_IN       (0x00000100)
@@ -110,11 +111,6 @@ LIS2DW12 lis2dw(SPI_MOSI, SPI_MISO, SPI_SCKL, SPI_SSL); // [LIS2DW12]    : MEMS 
 
 static InterruptIn button0(USER_BUTTON0);
 static InterruptIn button1(USER_BUTTON1);
-
-// OpenCV test
-static cv::Mat img_argb(240, 320, CV_8UC4, sensor_result_buffer);
-static uint8_t buf_yuv[320 * 240 * 2]__attribute((aligned(32)));
-static cv::Mat img_yuv(240, 320, CV_8UC2, buf_yuv);
 
 /*******************************************************************************
 * Function Name: normalize0to1
@@ -265,10 +261,10 @@ static void Start_LCD_Display(void) {
     rect.hw = HEATMAP_PIXEL_HW;
     Display.Graphics_Read_Setting(
         DisplayBase::GRAPHICS_LAYER_0,
-        (void *)buf_yuv,
-        SENSOR_WORK_BUFFER_STRIDE,
+        (void *)fbuf_yuv,
+        SENSOR_WORK_BUFFER_STRIDE_2,
         DisplayBase::GRAPHICS_FORMAT_YCBCR422,
-        DisplayBase::WR_RD_WRSWA_NON,
+        DisplayBase::WR_RD_WRSWA_32_16_8BIT,
         &rect
     );
     Display.Graphics_Start(DisplayBase::GRAPHICS_LAYER_0);
@@ -292,6 +288,14 @@ static void Start_LCD_Display(void) {
     EasyAttach_LcdBacklight(true);
 }
 
+// https://stackoverflow.com/questions/1737726/how-to-perform-rgb-yuv-conversion-in-c-c
+#define CLIP(X) ( (X) > 255 ? 255 : (X) < 0 ? 0 : X)
+
+// RGB -> YUV
+#define RGB2Y(R, G, B) CLIP(( (  66 * (R) + 129 * (G) +  25 * (B) + 128) >> 8) +  16)
+#define RGB2U(R, G, B) CLIP(( ( -38 * (R) -  74 * (G) + 112 * (B) + 128) >> 8) + 128)
+#define RGB2V(R, G, B) CLIP(( ( 112 * (R) -  94 * (G) -  18 * (B) + 128) >> 8) + 128)
+
 static void drp_task(void) {
     uint32_t idx = 0;
 
@@ -301,12 +305,12 @@ static void drp_task(void) {
     size_t encode_size;
     bitmap_buff_info.width              = HEATMAP_PIXEL_HW;
     bitmap_buff_info.height             = HEATMAP_PIXEL_VW;
-    bitmap_buff_info.format             = JPEG_Converter::WR_RD_ARGB8888;
-    bitmap_buff_info.buffer_address     = (void *)sensor_result_buffer;
+    bitmap_buff_info.format             = JPEG_Converter::WR_RD_YCbCr422;
+    bitmap_buff_info.buffer_address     = (void *)fbuf_yuv;
     encode_options.encode_buff_size     = sizeof(JpegBuffer);
-    encode_options.input_swapsetting    = JPEG_Converter::WR_RD_WRSWA_NON;
-    encode_options.height = HEATMAP_PIXEL_HW;
-    encode_options.width = HEATMAP_PIXEL_VW;
+    encode_options.input_swapsetting    = JPEG_Converter::WR_RD_WRSWA_32_16BIT;  //WR_RD_WRSWA_32BIT
+    encode_options.width = HEATMAP_PIXEL_HW;
+    encode_options.height = HEATMAP_PIXEL_VW;
 
     EasyAttach_Init(Display);
     // Interrupt callback function setting (Field end signal for recording function in scaler 0)
@@ -459,16 +463,30 @@ static void drp_task(void) {
             j++;
         }
 
+        for (uint i=0;i<sizeof(fbuf_yuv);i+=4) {
+            uint8_t r1 = sensor_result_buffer[i*2+2];
+            uint8_t g1 = sensor_result_buffer[i*2+1];
+            uint8_t b1 = sensor_result_buffer[i*2+0];
+            uint8_t r2 = sensor_result_buffer[i*2+6];
+            uint8_t g2 = sensor_result_buffer[i*2+5];
+            uint8_t b2 = sensor_result_buffer[i*2+4];
+
+            uint8_t y1 = RGB2Y(r1, g1, b1);
+            uint8_t u1 = RGB2U(r1, g1, b1);
+            uint8_t v1 = RGB2V(r1, g1, b1);
+            uint8_t y2 = RGB2Y(r2, g2, b2);
+
+            fbuf_yuv[i+0]=u1; // u
+            fbuf_yuv[i+1]=y1; // y
+            fbuf_yuv[i+2]=v1; // v
+            fbuf_yuv[i+3]=y2; // y
+        }
+        dcache_clean(fbuf_yuv, sizeof(fbuf_yuv));
+
         dcache_invalid(JpegBuffer, sizeof(JpegBuffer));
         if (Jcu.encode(&bitmap_buff_info, JpegBuffer, &encode_size, &encode_options) == JPEG_Converter::JPEG_CONV_OK) {
             display_app.SendJpeg(JpegBuffer, (int)encode_size);
         }
-
-        // Transform buffer into OpenCV matrix
-        cv::Mat img_rgb;
-        cv::cvtColor(img_argb, img_rgb, cv::COLOR_BGRA2RGB);
-        cv::cvtColor(img_rgb, img_yuv, cv::COLOR_RGB2YUV);
-        dcache_clean(buf_yuv, sizeof(buf_yuv));
 
         // display_app.SendRgb888(sensor_result_buffer, HEATMAP_PIXEL_HW, HEATMAP_PIXEL_VW);
     }
