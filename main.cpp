@@ -48,8 +48,8 @@
 
 /*! Frame buffer stride: Frame buffer stride should be set to a multiple of 32 or 128
     in accordance with the frame buffer burst transfer mode. */
-#define VIDEO_PIXEL_HW         (1280)    /* VGA */
-#define VIDEO_PIXEL_VW         (720)    /* VGA */
+#define VIDEO_PIXEL_HW         (1280)
+#define VIDEO_PIXEL_VW         (720)
 
 static DisplayBase Display;
 static DisplayApp  display_app;
@@ -62,8 +62,8 @@ static uint8_t fbuf_bayer[FRAME_BUFFER_STRIDE * FRAME_BUFFER_HEIGHT]__attribute(
 static uint8_t fbuf_gray[FRAME_BUFFER_STRIDE * FRAME_BUFFER_HEIGHT]__attribute((aligned(32)));
 
 // Buffer for sensor data
-#define HEATMAP_PIXEL_HW         (320)    /* VGA */
-#define HEATMAP_PIXEL_VW         (240)    /* VGA */
+#define HEATMAP_PIXEL_HW         (320)
+#define HEATMAP_PIXEL_VW         (240)
 
 #define SENSOR_RAW_BUFFER_STRIDE    (((4 * 1) + 31u) & ~31u)
 #define SENSOR_RAW_BUFFER_HEIGHT    (4)
@@ -71,11 +71,11 @@ static uint8_t fbuf_gray[FRAME_BUFFER_STRIDE * FRAME_BUFFER_HEIGHT]__attribute((
 #define SENSOR_RESULT_BUFFER_STRIDE  (((HEATMAP_PIXEL_HW * 4) + 31u) & ~31u)
 #define SENSOR_RESULT_BUFFER_HEIGHT  (HEATMAP_PIXEL_VW)
 static uint8_t sensor_raw_buffer[SENSOR_RAW_BUFFER_STRIDE * SENSOR_RAW_BUFFER_HEIGHT]__attribute((section("NC_BSS")));
-static uint8_t sensor_work_buffer[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("NC_BSS")));
-uint8_t sensor_result_buffer[SENSOR_RESULT_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("NC_BSS")));
+static uint8_t sensor_work_buffer[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("OCTA_BSS"),aligned(32)));
+uint8_t sensor_result_buffer[SENSOR_RESULT_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("OCTA_BSS"),aligned(32)));
 
-static uint8_t fbuf_work0[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((aligned(32)));
-static uint8_t fbuf_work1[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((aligned(32)));
+static uint8_t fbuf_work0[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("OCTA_BSS"),aligned(32)));
+static uint8_t fbuf_work1[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("OCTA_BSS"),aligned(32)));
 static uint8_t fbuf_clat8[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((aligned(32)));
 static uint8_t drp_work_buf[((SENSOR_WORK_BUFFER_STRIDE * ((SENSOR_RESULT_BUFFER_HEIGHT / 3) + 2)) * 2) * 3]__attribute((section("NC_BSS")));
 
