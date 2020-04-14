@@ -253,14 +253,14 @@ static void Start_LCD_Display(void) {
     rect.hs = HEATMAP_PIXEL_HW;
     rect.hw = HEATMAP_PIXEL_HW;
     Display.Graphics_Read_Setting(
-        DisplayBase::GRAPHICS_LAYER_0,
+        DisplayBase::GRAPHICS_LAYER_2,
         (void *)fbuf_clat8,
         SENSOR_WORK_BUFFER_STRIDE,
         DisplayBase::GRAPHICS_FORMAT_CLUT8,
         DisplayBase::WR_RD_WRSWA_32_16_8BIT,
         &rect
     );
-    Display.Graphics_Start(DisplayBase::GRAPHICS_LAYER_0);
+    Display.Graphics_Start(DisplayBase::GRAPHICS_LAYER_2);
 
     // for sensor image
     rect.vs = 0;
@@ -268,14 +268,14 @@ static void Start_LCD_Display(void) {
     rect.hs = 0;
     rect.hw = HEATMAP_PIXEL_HW;
     Display.Graphics_Read_Setting(
-        DisplayBase::GRAPHICS_LAYER_2,
+        DisplayBase::GRAPHICS_LAYER_0,
         (void *)fbuf_yuv,
         SENSOR_WORK_BUFFER_STRIDE_2,
         DisplayBase::GRAPHICS_FORMAT_YCBCR422,
         DisplayBase::WR_RD_WRSWA_32_16_8BIT,
         &rect
     );
-    Display.Graphics_Start(DisplayBase::GRAPHICS_LAYER_2);
+    Display.Graphics_Start(DisplayBase::GRAPHICS_LAYER_0);
 
     ThisThread::sleep_for(50);
     EasyAttach_LcdBacklight(true);
