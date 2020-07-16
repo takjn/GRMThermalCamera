@@ -27,20 +27,13 @@
 #include "EasyAttach_CameraAndLCD.h"
 #include "AsciiFont.h"
 #include "r_dk2_if.h"
-#include "r_drp_bayer2grayscale.h"
-#include "r_drp_median_blur.h"
-#include "r_drp_canny_calculate.h"
-#include "r_drp_canny_hysterisis.h"
+#include "r_drp_simple_isp.h"
 #include "r_drp_resize_bilinear.h"
 #include "dcache-control.h"
 #include "DisplayApp.h"
 #include "JPEG_Converter.h"
 
 #include "D6T_44L_06.h"
-#include "SHT30_DIS_B.h"
-#include "OPT3001DNP.h"
-#include "BARO_2SMPB_02E.h"
-#include "LIS2DW12.h"
 
 #ifndef MBED_CONF_APP_LCD
     #error "MBED_CONF_APP_LCD is not set"
@@ -53,17 +46,17 @@
 
 static DisplayBase Display;
 static DisplayApp  display_app;
-static uint8_t JpegBuffer[1024 * 64]__attribute((aligned(32)));
+static uint8_t JpegBuffer[1024 * 128]__attribute((aligned(32)));
 
 // Buffer for video
 #define FRAME_BUFFER_STRIDE    (((VIDEO_PIXEL_HW * 1) + 63u) & ~63u)
 #define FRAME_BUFFER_HEIGHT    (VIDEO_PIXEL_VW)
 static uint8_t fbuf_bayer[FRAME_BUFFER_STRIDE * FRAME_BUFFER_HEIGHT]__attribute((aligned(128)));
-static uint8_t fbuf_gray[FRAME_BUFFER_STRIDE * FRAME_BUFFER_HEIGHT]__attribute((aligned(32)));
+static uint8_t fbuf_camera[FRAME_BUFFER_STRIDE*2 * FRAME_BUFFER_HEIGHT]__attribute((section("OCTA_BSS"),aligned(32)));
 
 // Buffer for sensor data
-#define HEATMAP_PIXEL_HW         (320)
-#define HEATMAP_PIXEL_VW         (240)
+#define HEATMAP_PIXEL_HW         (1280)
+#define HEATMAP_PIXEL_VW         (720)
 
 #define SENSOR_RAW_BUFFER_STRIDE    (((4 * 1) + 31u) & ~31u)
 #define SENSOR_RAW_BUFFER_HEIGHT    (4)
@@ -73,11 +66,6 @@ static uint8_t fbuf_gray[FRAME_BUFFER_STRIDE * FRAME_BUFFER_HEIGHT]__attribute((
 static uint8_t sensor_raw_buffer[SENSOR_RAW_BUFFER_STRIDE * SENSOR_RAW_BUFFER_HEIGHT]__attribute((section("NC_BSS")));
 static uint8_t sensor_work_buffer[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("OCTA_BSS"),aligned(32)));
 uint8_t sensor_result_buffer[SENSOR_RESULT_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("OCTA_BSS"),aligned(32)));
-
-static uint8_t fbuf_work0[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("OCTA_BSS"),aligned(32)));
-static uint8_t fbuf_work1[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((section("OCTA_BSS"),aligned(32)));
-static uint8_t fbuf_clat8[SENSOR_WORK_BUFFER_STRIDE * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((aligned(32)));
-static uint8_t drp_work_buf[((SENSOR_WORK_BUFFER_STRIDE * ((SENSOR_RESULT_BUFFER_HEIGHT / 3) + 2)) * 2) * 3]__attribute((section("NC_BSS")));
 
 #define SENSOR_WORK_BUFFER_STRIDE_2  (((HEATMAP_PIXEL_HW * 2) + 31u) & ~31u)
 static uint8_t fbuf_yuv[SENSOR_WORK_BUFFER_STRIDE_2 * SENSOR_RESULT_BUFFER_HEIGHT]__attribute((aligned(32)));
@@ -97,8 +85,12 @@ static uint8_t fbuf_yuv[SENSOR_WORK_BUFFER_STRIDE_2 * SENSOR_RESULT_BUFFER_HEIGH
 #define DRP_FLG_CAMER_IN       (0x00000100)
 static uint8_t drp_lib_id[R_DK2_TILE_NUM] = {0};
 static Thread drpTask(osPriorityHigh, 1024*8);
-static uint8_t nc_memory[512] __attribute((section("NC_BSS")));
+static r_drp_simple_isp_t param_isp __attribute((section("NC_BSS")));
 static r_drp_resize_bilinear_t param_resize_bilinear __attribute((section("NC_BSS")));
+
+// Alpha ratio for blending camera image and heat map
+static float display_alpha = 0.5;
+static bool show_value = true;
 
 // Variables for omron sensor
 // D6T_44L_06
@@ -106,16 +98,11 @@ static D6T_44L_06 d6t_44l(I2C_SDA, I2C_SCL);
 static Thread sensorTask(osPriorityNormal, 1024*8);
 #define TILE_TEMP_MARGIN_UPPER (20)
 #define TILE_TEMP_MARGIN_UNDER (70)
-static uint8_t display_alpha = 128;
 static int16_t pdta;
 static int16_t buf[16];
 
 // 2JCIE-EV01-RP1
 #define CONV_RAW_TO_MG(x) (int)((double)(x) * 4000.0 / 32767.0)
-SHT30_DIS_B sht30(I2C_SDA, I2C_SCL);                    // [SHT30-DIS-B] : Temperature / humidity sensor
-OPT3001DNP opt3001(I2C_SDA, I2C_SCL);                   // [OPT3001DNP]  : Ambient light sensor
-BARO_2SMPB_02E baro_2smpb(I2C_SDA, I2C_SCL);            // [2SMPB-02E]   : MEMS digital barometric pressure sensor
-LIS2DW12 lis2dw(SPI_MOSI, SPI_MISO, SPI_SCKL, SPI_SSL); // [LIS2DW12]    : MEMS digital motion sensor
 
 static InterruptIn button0(USER_BUTTON0);
 static InterruptIn button1(USER_BUTTON1);
@@ -247,22 +234,6 @@ static void Start_Video_Camera(void) {
 static void Start_LCD_Display(void) {
     DisplayBase::rect_t rect;
 
-    // for camera image
-    rect.vs = 0;
-    rect.vw = HEATMAP_PIXEL_VW;
-    rect.hs = HEATMAP_PIXEL_HW;
-    rect.hw = HEATMAP_PIXEL_HW;
-    Display.Graphics_Read_Setting(
-        DisplayBase::GRAPHICS_LAYER_2,
-        (void *)fbuf_clat8,
-        SENSOR_WORK_BUFFER_STRIDE,
-        DisplayBase::GRAPHICS_FORMAT_CLUT8,
-        DisplayBase::WR_RD_WRSWA_32_16_8BIT,
-        &rect
-    );
-    Display.Graphics_Start(DisplayBase::GRAPHICS_LAYER_2);
-
-    // for sensor image
     rect.vs = 0;
     rect.vw = HEATMAP_PIXEL_VW;
     rect.hs = 0;
@@ -282,8 +253,6 @@ static void Start_LCD_Display(void) {
 }
 
 static void drp_task(void) {
-    uint32_t idx = 0;
-
     JPEG_Converter  Jcu;
     JPEG_Converter::bitmap_buff_info_t bitmap_buff_info;
     JPEG_Converter::encode_options_t   encode_options;
@@ -311,23 +280,23 @@ static void drp_task(void) {
     while (true) {
         ThisThread::flags_wait_all(DRP_FLG_CAMER_IN);
 
-        // Bayer2Grayscale
-        R_DK2_Load(
-                   g_drp_lib_bayer2grayscale,
-                   R_DK2_TILE_0 | R_DK2_TILE_1 | R_DK2_TILE_2 | R_DK2_TILE_3 | R_DK2_TILE_4 | R_DK2_TILE_5,
-                   R_DK2_TILE_PATTERN_1_1_1_1_1_1, NULL, &cb_drp_finish, drp_lib_id);
+        /* SimpleIsp bayer2yuv_6 */
+        R_DK2_Load(g_drp_lib_simple_isp_bayer2yuv_6,
+            R_DK2_TILE_0,
+            R_DK2_TILE_PATTERN_6, NULL, &cb_drp_finish, drp_lib_id);
         R_DK2_Activate(0, 0);
-
-        r_drp_bayer2grayscale_t * param_b2g = (r_drp_bayer2grayscale_t *)nc_memory;
-        for (idx = 0; idx < R_DK2_TILE_NUM; idx++) {
-            param_b2g[idx].src    = (uint32_t)fbuf_bayer + (VIDEO_PIXEL_HW * (VIDEO_PIXEL_VW / R_DK2_TILE_NUM) * idx);
-            param_b2g[idx].dst    = (uint32_t)fbuf_gray + (VIDEO_PIXEL_HW * (VIDEO_PIXEL_VW / R_DK2_TILE_NUM) * idx);
-            param_b2g[idx].width  = VIDEO_PIXEL_HW;
-            param_b2g[idx].height = VIDEO_PIXEL_VW / R_DK2_TILE_NUM;
-            param_b2g[idx].top    = (idx == 0) ? 1 : 0;
-            param_b2g[idx].bottom = (idx == 5) ? 1 : 0;
-            R_DK2_Start(drp_lib_id[idx], (void *)&param_b2g[idx], sizeof(r_drp_bayer2grayscale_t));
-        }
+        memset(&param_isp, 0, sizeof(param_isp));
+        param_isp.src    = (uint32_t)fbuf_bayer;
+        param_isp.dst    = (uint32_t)fbuf_camera;
+        param_isp.width  = VIDEO_PIXEL_HW;
+        param_isp.height = VIDEO_PIXEL_VW;
+        param_isp.gain_r = 0x1800;
+        param_isp.gain_g = 0x1000;
+        param_isp.gain_b = 0x1C00;
+        param_isp.bias_r = 20;
+        param_isp.bias_g = 20;
+        param_isp.bias_b = 20;
+        R_DK2_Start(drp_lib_id[0], (void *)&param_isp, sizeof(r_drp_simple_isp_t));
         ThisThread::flags_wait_all(DRP_FLG_TILE_ALL);
         R_DK2_Unload(0, drp_lib_id);
 
@@ -336,18 +305,6 @@ static void drp_task(void) {
             R_DK2_TILE_0,
             R_DK2_TILE_PATTERN_6, NULL, &cb_drp_finish, drp_lib_id);
         R_DK2_Activate(0, 0);
-
-        // reduction camera image
-        memset(&param_resize_bilinear, 0, sizeof(param_resize_bilinear));
-        param_resize_bilinear.src    = (uint32_t)fbuf_gray;
-        param_resize_bilinear.dst    = (uint32_t)fbuf_work0;
-        param_resize_bilinear.src_width  = VIDEO_PIXEL_HW;
-        param_resize_bilinear.src_height = VIDEO_PIXEL_VW;
-        param_resize_bilinear.dst_width  = HEATMAP_PIXEL_HW;
-        param_resize_bilinear.dst_height = HEATMAP_PIXEL_VW;
-        R_DK2_Start(drp_lib_id[0], (void *)&param_resize_bilinear, sizeof(r_drp_resize_bilinear_t));
-        ThisThread::flags_wait_all(DRP_FLG_TILE_ALL);
-
         // magnification sensor data
         memset(&param_resize_bilinear, 0, sizeof(param_resize_bilinear));
         param_resize_bilinear.src    = (uint32_t)sensor_raw_buffer;
@@ -361,111 +318,49 @@ static void drp_task(void) {
 
         R_DK2_Unload(0, drp_lib_id);
 
-        // MedianBlur
-        R_DK2_Load(
-                   g_drp_lib_median_blur,
-                   R_DK2_TILE_0 | R_DK2_TILE_1 | R_DK2_TILE_2 | R_DK2_TILE_3 | R_DK2_TILE_4 | R_DK2_TILE_5,
-                   R_DK2_TILE_PATTERN_1_1_1_1_1_1, NULL, &cb_drp_finish, drp_lib_id);
-        R_DK2_Activate(0, 0);
+        if (show_value) {
+            // draw sensor value
+            for (int y=0;y<4;y++) {
+                for (int x=0;x<4;x++) {
+                    int px = HEATMAP_PIXEL_HW / 4 * (x + 1) - HEATMAP_PIXEL_HW / 6;
+                    int py = HEATMAP_PIXEL_VW / 4 * (y + 1) - HEATMAP_PIXEL_VW / 7;
 
-        r_drp_median_blur_t * param_median = (r_drp_median_blur_t *)nc_memory;
-        for (idx = 0; idx < R_DK2_TILE_NUM; idx++) {
-            param_median[idx].src    = (uint32_t)fbuf_work0 + (HEATMAP_PIXEL_HW * (HEATMAP_PIXEL_VW / R_DK2_TILE_NUM) * idx);
-            param_median[idx].dst    = (uint32_t)fbuf_work1 + (HEATMAP_PIXEL_HW * (HEATMAP_PIXEL_VW / R_DK2_TILE_NUM) * idx);
-            param_median[idx].width  = HEATMAP_PIXEL_HW;
-            param_median[idx].height = HEATMAP_PIXEL_VW / R_DK2_TILE_NUM;
-            param_median[idx].top    = (idx == 0) ? 1 : 0;
-            param_median[idx].bottom = (idx == 5) ? 1 : 0;
-            R_DK2_Start(drp_lib_id[idx], (void *)&param_median[idx], sizeof(r_drp_median_blur_t));
-        }
-        ThisThread::flags_wait_all(DRP_FLG_TILE_ALL);
-        R_DK2_Unload(0, drp_lib_id);
-
-        // CannyCalculate
-        R_DK2_Load(
-                   g_drp_lib_canny_calculate,
-                   R_DK2_TILE_0 | R_DK2_TILE_2 | R_DK2_TILE_4,
-                   R_DK2_TILE_PATTERN_2_2_2, NULL, &cb_drp_finish, drp_lib_id);
-        R_DK2_Activate(0, 0);
-
-        r_drp_canny_calculate_t * param_canny_cal = (r_drp_canny_calculate_t *)nc_memory;
-        for (idx = 0; idx < 3; idx++) {
-            param_canny_cal[idx].src    = (uint32_t)fbuf_work1 + (HEATMAP_PIXEL_HW * (HEATMAP_PIXEL_VW / 3) * idx);
-            param_canny_cal[idx].dst    = (uint32_t)fbuf_work0 + (HEATMAP_PIXEL_HW * (HEATMAP_PIXEL_VW / 3) * idx);
-            param_canny_cal[idx].width  = HEATMAP_PIXEL_HW;
-            param_canny_cal[idx].height = (HEATMAP_PIXEL_VW / 3);
-            param_canny_cal[idx].top    = ((idx * 2) == 0) ? 1 : 0;
-            param_canny_cal[idx].bottom = ((idx * 2) == 4) ? 1 : 0;
-            param_canny_cal[idx].work   = (uint32_t)&drp_work_buf[((HEATMAP_PIXEL_HW * ((HEATMAP_PIXEL_VW / 3) + 2)) * 2) * idx];
-            param_canny_cal[idx].threshold_high = 0x28;
-            param_canny_cal[idx].threshold_low  = 0x18;
-            R_DK2_Start(drp_lib_id[(idx * 2)], (void *)&param_canny_cal[idx], sizeof(r_drp_canny_calculate_t));
-        }
-        ThisThread::flags_wait_all(DRP_FLG_TILE_ALL);
-        R_DK2_Unload(0, drp_lib_id);
-
-        // CannyHysterisis
-        R_DK2_Load(
-                   g_drp_lib_canny_hysterisis,
-                   R_DK2_TILE_0,
-                   R_DK2_TILE_PATTERN_6, NULL, &cb_drp_finish, drp_lib_id);
-        R_DK2_Activate(0, 0);
-
-        r_drp_canny_hysterisis_t * param_canny_hyst = (r_drp_canny_hysterisis_t *)nc_memory;
-        param_canny_hyst[0].src    = (uint32_t)fbuf_work0;
-        param_canny_hyst[0].dst    = (uint32_t)fbuf_clat8;
-        param_canny_hyst[0].width  = HEATMAP_PIXEL_HW;
-        param_canny_hyst[0].height = HEATMAP_PIXEL_VW;
-        param_canny_hyst[0].work   = (uint32_t)drp_work_buf;
-        param_canny_hyst[0].iterations = 2;
-        R_DK2_Start(drp_lib_id[0], (void *)&param_canny_hyst[0], sizeof(r_drp_canny_hysterisis_t));
-        ThisThread::flags_wait_all(DRP_FLG_TILE_ALL);
-        R_DK2_Unload(0, drp_lib_id);
-
-        // draw sensor value
-        // sprintf(str, "PTAT: %6.1f[degC]   ", pdta / 10.0);
-        // ascii_font.DrawStr(str, (AsciiFont::CHAR_PIX_WIDTH)*2, (AsciiFont::CHAR_PIX_HEIGHT)*2, 0xFFFFFFFF, 2);
-        for (int y=0;y<4;y++) {
-            for (int x=0;x<4;x++) {
-                int px = HEATMAP_PIXEL_HW / 4 * (x + 1) - HEATMAP_PIXEL_HW / 6;
-                int py = HEATMAP_PIXEL_VW / 4 * (y + 1) - HEATMAP_PIXEL_VW / 7;
-
-                sprintf(str, "%4.1f   ", buf[y*4+x] / 10.0);
-                ascii_font.DrawStr(str, px, py, 0xFFFFFFFF, 2);
-            }
-        }
-
-        uint32_t *p = (uint32_t*)sensor_result_buffer;
-        uint j=0;
-        for (uint i=0;i<sizeof(sensor_work_buffer);i++) {
-            if (p[j] != 0xFFFFFFFF) {
-                if (fbuf_clat8[i] == 0xFF) {
-                    p[j] = 0xFF000000;
-                } else {
-                    p[j] = colors[sensor_work_buffer[i]];
+                    sprintf(str, "%4.1f   ", buf[y*4+x] / 10.0);
+                    ascii_font.DrawStr(str, px, py, 0xFFFFFFFF, 4);
                 }
             }
-            j++;
-        }
 
-        // convert RGB to YUV for JCU
-        for (uint i=0;i<sizeof(fbuf_yuv);i+=4) {
-            uint8_t r1 = sensor_result_buffer[i*2+2];
-            uint8_t g1 = sensor_result_buffer[i*2+1];
-            uint8_t b1 = sensor_result_buffer[i*2+0];
-            uint8_t r2 = sensor_result_buffer[i*2+6];
-            uint8_t g2 = sensor_result_buffer[i*2+5];
-            uint8_t b2 = sensor_result_buffer[i*2+4];
+            uint32_t *p = (uint32_t*)sensor_result_buffer;
+            uint j=0;
+            for (uint i=0;i<sizeof(sensor_work_buffer);i++) {
+                if (p[j] != 0xFFFFFFFF) {
+                    p[j] = colors[sensor_work_buffer[i]];
+                }
+                j++;
+            }
 
-            uint8_t y1 = RGB2Y(r1, g1, b1);
-            uint8_t u1 = RGB2U(r1, g1, b1);
-            uint8_t v1 = RGB2V(r1, g1, b1);
-            uint8_t y2 = RGB2Y(r2, g2, b2);
+            // convert RGB to YUV for JCU
+            float display_alpha2 = (1 - display_alpha);
+            for (uint i=0;i<sizeof(fbuf_yuv);i+=4) {
+                uint8_t r1 = sensor_result_buffer[i*2+2];
+                uint8_t g1 = sensor_result_buffer[i*2+1];
+                uint8_t b1 = sensor_result_buffer[i*2+0];
+                uint8_t r2 = sensor_result_buffer[i*2+6];
+                uint8_t g2 = sensor_result_buffer[i*2+5];
+                uint8_t b2 = sensor_result_buffer[i*2+4];
 
-            fbuf_yuv[i+0]=u1; // u
-            fbuf_yuv[i+1]=y1; // y
-            fbuf_yuv[i+2]=v1; // v
-            fbuf_yuv[i+3]=y2; // y
+                uint8_t y1 = RGB2Y(r1, g1, b1);
+                uint8_t u1 = RGB2U(r1, g1, b1);
+                uint8_t v1 = RGB2V(r1, g1, b1);
+                uint8_t y2 = RGB2Y(r2, g2, b2);
+
+                fbuf_yuv[i+0]=((float)fbuf_camera[i+0]*display_alpha + (float)u1*display_alpha2); // u
+                fbuf_yuv[i+1]=((float)fbuf_camera[i+1]*display_alpha + (float)y1*display_alpha2); // y
+                fbuf_yuv[i+2]=((float)fbuf_camera[i+2]*display_alpha + (float)v1*display_alpha2); // v
+                fbuf_yuv[i+3]=((float)fbuf_camera[i+3]*display_alpha + (float)y2*display_alpha2); // y
+            }
+        } else {
+            memcpy(fbuf_yuv, fbuf_camera, sizeof(fbuf_camera));
         }
         dcache_clean(fbuf_yuv, sizeof(fbuf_yuv));
 
@@ -477,20 +372,8 @@ static void drp_task(void) {
 }
 
 static void sensor_task(void) {
-    int32_t humi, temp32;
-    uint32_t illm;
-    uint32_t pres, dp, dt;
-    int16_t temp16;
-    int16_t accl[3];
-
-    // printf("\x1b[2J");  // Clear screen
-
     // setup sensors
     d6t_44l.setup();
-    baro_2smpb.setup();
-    sht30.setup();
-    opt3001.setup();
-    lis2dw.setup();
     ThisThread::sleep_for(150);
 
     while (true) {
@@ -503,42 +386,18 @@ static void sensor_task(void) {
             uint8_t a = (normalize0to1(buf[i], pdta - TILE_TEMP_MARGIN_UNDER,  pdta + TILE_TEMP_MARGIN_UPPER) * 255.0);
             sensor_raw_buffer[i]=a;
         }
-
-        // printf("\x1b[%d;%dH", 0, 0);  // Move cursor (y , x)
-        // printf("GR-MANGO x Omron 2JCIE-EV01 Demo\r\n\r\n");
-
-        // sht30.read(&humi, &temp32);
-        // printf("[SHT30-DIS-B] Temperature / humidity sensor\r\n");
-        // printf("   temperature : %5.2f [degC]\r\n", temp32 / 100.0);
-        // printf("   humidity    : %5.2f [%%RH]\r\n", humi / 100.0);
-        // printf("\r\n");
-
-        // opt3001.read(&illm);
-        // printf("[OPT3001DNP] Ambient light sensor\r\n");
-        // printf("   illuminance : %5.2f [lx]\r\n", illm / 100.0);
-        // printf("\r\n");
-
-        // baro_2smpb.read(&pres, &temp16, &dp, &dt);
-        // printf("[2SMPB-02E] MEMS digital barometric pressure sensor\r\n");
-        // printf("   pressure    : %7.1f [Pa] (%08Xh)\r\n", pres / 10.0 , (unsigned int)dp);
-        // printf("   temperature : %5.2f [degC] (%08Xh)\r\n", temp16 / 100.0, (unsigned int)dt);
-        // printf("\r\n");
-
-        // lis2dw.read(accl);
-        // printf("[LIS2DW12] MEMS digital motion sensor\r\n");
-        // printf("   x : %5d [mg]\r\n", CONV_RAW_TO_MG(accl[0]));
-        // printf("   y : %5d [mg]\r\n", CONV_RAW_TO_MG(accl[1]));
-        // printf("   z : %5d [mg]\r\n", CONV_RAW_TO_MG(accl[2]));
-        // printf("\r\n");
     }
 }
 
 static void button_fall0(void) {
-    display_alpha+=64;
+    display_alpha+=0.2;
+    if (display_alpha > 1.0) {
+        display_alpha = 0.0;
+    }
 }
 
 static void button_fall1(void) {
-    display_alpha-=64;
+    show_value = !show_value;
 }
 
 int main(void) {
